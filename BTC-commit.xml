@@ -1,0 +1,256 @@
+<?xml version="1.0" encoding="utf-8"?><!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.1//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_1.dtd'><nta><declaration>const int KEYS_NUM = 2;
+const int SECRETS_NUM = 1;
+const int NSS_NUM = 1; //NON_STANDARD_SCRIPTS
+const int PARTIES_NUM = 2 + 1; // + ADVERSARY
+const int PROT_TX_NUM = 4;
+const int NONCE_NUM = 2;
+const int TX_NUM = 2 * PROT_TX_NUM;
+const int KNOWN_SIGNATURES_SIZE = 1;
+const int C_KEY = 0;
+const int R_KEY = 1;
+const int C_SEC = 0;
+const int MAX_LATENCY = 10;
+const int TIMERS_NUM = 1;
+const int PROT_TIMELOCK = 100;
+clock time;
+int timer_t[TIMERS_NUM] = {PROT_TIMELOCK - MAX_LATENCY};
+bool timer_passed[TIMERS_NUM];
+
+typedef int[0,KEYS_NUM-1] Key;
+typedef int[0,SECRETS_NUM-1] Secret;
+typedef int[0,NSS_NUM-1] Nss;
+typedef int[0,PARTIES_NUM-1] PartyId;
+typedef int[0,TX_NUM-1] TxId;
+typedef int[0,NONCE_NUM-1] Nonce;
+typedef int[0,TIMERS_NUM-1] Timer;
+typedef int[0,4] Status;
+
+const PartyId ALICE = 0;
+const PartyId BOB = 1;
+const PartyId ADVERSARY = PARTIES_NUM - 1;
+
+const Status UNSENT = 0;
+const Status SENT = 1;
+const Status CONFIRMED = 2;
+const Status SPENT = 3;
+const Status CANCELED = 4;
+
+typedef struct {
+	Key key;
+	TxId tx_num;
+	Nonce input_nonce;
+} Signature;
+
+typedef struct {
+    bool standard;
+    Key key;
+    Nss script;
+} OutputScript;
+
+typedef struct {
+	TxId num;
+	TxId input;
+	Status status;
+	OutputScript out_script;
+	int value;
+	int timelock;
+	bool timelock_passed;
+	Nonce nonce;
+	bool reveals_secret;
+	Secret secret_revealed;
+} Tx;
+
+Tx bc[TX_NUM];
+clock bc_clock[TX_NUM];
+urgent chan urg_chan, signature;
+
+typedef struct {
+	bool know_key[KEYS_NUM];
+	bool know_secret[SECRETS_NUM];
+	int[0,KNOWN_SIGNATURES_SIZE] known_signatures_size;
+	Signature known_signatures[KNOWN_SIGNATURES_SIZE];
+} Party;
+
+Party parties[PARTIES_NUM];
+
+Signature create_signature(Key key, TxId tx_num, Nonce input_nonce) {
+	Signature res = {key, tx_num, input_nonce};
+	return res;
+}
+
+Signature create_signature_tx(Key key, Tx t) {
+    return create_signature(key, t.num, bc[t.input].nonce);
+}
+
+void add_signature(Party&amp; p, Signature s) {
+	p.known_signatures[p.known_signatures_size++] = s;
+}
+
+void broadcast_signature(Signature s) {
+	for(i : PartyId)
+		add_signature(parties[i], s);
+}
+
+OutputScript create_standard_output_script(Key key) {
+	OutputScript res = {true, key, 0};
+	return res;
+}
+
+OutputScript create_nss(Nss nss) {
+	OutputScript res = {false, 0, nss};
+	return res;
+}
+
+Tx create_standard_tx(TxId num, TxId input, Key recipient) {
+	Tx res;
+	Tx in = bc[input];
+	res.num = num;
+	res.input = input;
+	res.value = in.value;
+	res.out_script = create_standard_output_script(recipient);
+	return res;
+}
+
+bool was_malled(Tx t) {
+	return t.nonce != 0;
+}
+
+bool is_waiting(Tx t) {
+	return t.status == SENT;
+}
+
+bool is_valid(Tx t) {
+	return t.timelock_passed and bc[t.input].status == CONFIRMED;
+}
+
+void confirm(Tx&amp; t, Nonce n) {
+	t.status = CONFIRMED;
+	t.nonce = n;
+	bc[t.input].status = SPENT;
+}
+
+void cancel(Tx&amp; t) {
+	t.status = CANCELED;
+}
+
+void try_to_confirm(Tx&amp; t, Nonce n) {
+	if(is_valid(t))
+		confirm(t, n);
+	else
+		cancel(t);
+}
+
+void send(Tx&amp; t) {
+	t.status = SENT;
+	bc_clock[t.num] = 0;
+	if(t.reveals_secret)
+		for(i : PartyId)
+			parties[i].know_secret[t.secret_revealed] = true;
+}
+
+bool know_signature(Party p, Tx t, Key key) {
+	int i;
+	if(p.know_key[key]) return true;
+	if(t.num &gt;= TX_NUM) return false;
+	for(i = 0; i &lt; p.known_signatures_size; i++) {
+		Signature s = p.known_signatures[i];
+		if(s.tx_num == t.num and s.input_nonce == bc[t.input].nonce
+				     and s.key == key)
+			return true;
+	}
+	return false;
+}
+
+bool can_create_input_script(Party p, Tx t) {
+	OutputScript o = bc[t.input].out_script;
+	if(o.standard) 
+		return know_signature(p, t, o.key);
+	if(o.script == 0) 
+		return     (know_signature(p, t, C_KEY) and p.know_secret[0] 
+				    and t.reveals_secret and t.secret_revealed == C_SEC)
+			or (know_signature(p, t, C_KEY) and know_signature(p, t, R_KEY));
+	return false;
+}
+
+bool can_send(Party p, Tx t) {
+	return t.status == UNSENT and is_valid(t) and can_create_input_script(p, t);
+}
+
+void try_to_send(Party p, Tx&amp; t) {
+	if(can_send(p, t))
+		send(t);
+}
+
+bool own(Party p, Tx t) {
+	OutputScript out = t.out_script;
+	return t.status == CONFIRMED and out.standard and p.know_key[out.key];
+}
+
+int count_owners(Tx t) {
+	int res = 0;
+	for(i : PartyId)
+		if(own(parties[i], t))
+			res++;
+	return res;
+}
+
+int hold_bitcoins(Party p) {
+	int res = 0;
+	for(i : TxId)
+		if(own(p, bc[i]) and count_owners(bc[i]) == 1)
+			res += bc[i].value;
+	return res;
+}
+
+bool sig_sent;
+Signature sig;
+const Key ADV_KEY = C_KEY;
+
+const TxId INPUT = 0;
+const TxId COMMIT = 1;
+const TxId OPEN = 2;
+const TxId FUSE = 3;
+
+urgent chan send_sig;
+
+Tx create_prot_tx(TxId num) {
+	Tx res;
+	if(num == INPUT)  { res = create_standard_tx(num, INPUT,  C_KEY); 
+			    res.value = 1; res.status = CONFIRMED; }
+	if(num == COMMIT) { res = create_standard_tx(num, INPUT,  C_KEY); 
+			    res.out_script = create_nss(0); }
+	if(num == OPEN)   { res = create_standard_tx(num, COMMIT, C_KEY); 
+			    res.reveals_secret = true; res.secret_revealed = C_SEC; }
+	if(num == FUSE)   { res = create_standard_tx(num, COMMIT, R_KEY); 
+			    res.timelock = PROT_TIMELOCK; }
+	return res;
+}
+
+void init_prot() {
+	parties[ALICE].know_key[C_KEY] = true;
+	parties[ALICE].know_secret[C_SEC] = true;
+	parties[BOB].know_key[R_KEY] = true;
+	parties[ADVERSARY] = parties[ALICE];
+}
+
+void init_bc() {
+	int i;
+	for(i : TxId) {
+		if(i &lt; PROT_TX_NUM)
+			bc[i] = create_prot_tx(i);
+		else
+			bc[i] = create_standard_tx(i, i - PROT_TX_NUM, ADV_KEY);
+		if(bc[i].timelock == 0)
+			bc[i].timelock_passed = true;
+	}
+}</declaration><template><name x="5" y="5">BlockChainAgent</name><declaration>// Place local declarations here.
+</declaration><location id="id0" x="16" y="-32"><committed/></location><location id="id1" x="208" y="-32"><label kind="invariant" x="240" y="-56">forall(i : TxId) (is_waiting(bc[i]) imply bc_clock[i] &lt; MAX_LATENCY)
+and
+forall(i : TxId) ((not bc[i].timelock_passed) imply time &lt;= bc[i].timelock)</label></location><init ref="id0"/><transition><source ref="id1"/><target ref="id1"/><label kind="select" x="160" y="-136">i : TxId</label><label kind="guard" x="8" y="-120">time == bc[i].timelock and (not bc[i].timelock_passed)</label><label kind="assignment" x="88" y="-104">bc[i].timelock_passed = true</label><nail x="144" y="-80"/><nail x="272" y="-80"/></transition><transition><source ref="id0"/><target ref="id1"/><label kind="assignment" x="56" y="-56">init_bc()</label></transition><transition><source ref="id1"/><target ref="id1"/><label kind="select" x="128" y="24">i : TxId, n : Nonce</label><label kind="guard" x="136" y="40">is_waiting(bc[i])</label><label kind="assignment" x="112" y="56">try_to_confirm(bc[i], n)</label><nail x="272" y="16"/><nail x="144" y="16"/></transition></template><template><name>Alice</name><parameter>Party&amp; me</parameter><location id="id2" x="512" y="40"></location><location id="id3" x="512" y="-40"><urgent/></location><location id="id4" x="768" y="-128"></location><location id="id5" x="512" y="-128"></location><location id="id6" x="264" y="-128"></location><location id="id7" x="16" y="-128"><urgent/></location><init ref="id7"/><transition><source ref="id3"/><target ref="id2"/><label kind="assignment" x="520" y="-8">try_to_send(me, bc[OPEN])</label></transition><transition><source ref="id4"/><target ref="id3"/><label kind="guard" x="656" y="-88">timer_passed[0]</label><label kind="synchronisation" x="656" y="-73">urg_chan?</label></transition><transition><source ref="id5"/><target ref="id3"/><label kind="guard" x="512" y="-112">timer_passed[0]</label><label kind="synchronisation" x="512" y="-97">urg_chan?</label></transition><transition><source ref="id6"/><target ref="id3"/><label kind="guard" x="256" y="-79">timer_passed[0]</label><label kind="synchronisation" x="256" y="-64">urg_chan?</label></transition><transition><source ref="id5"/><target ref="id4"/><label kind="synchronisation" x="632" y="-152">urg_chan?</label><label kind="assignment" x="536" y="-168">broadcast_signature(create_signature_tx(C_KEY, bc[FUSE]))</label></transition><transition><source ref="id6"/><target ref="id5"/><label kind="guard" x="256" y="-184">bc[COMMIT].status == CONFIRMED</label><label kind="synchronisation" x="336" y="-168">urg_chan?</label></transition><transition><source ref="id7"/><target ref="id6"/><label kind="assignment" x="24" y="-160">try_to_send(me, bc[COMMIT])</label></transition></template><template><name>Helper</name><location id="id8" x="16" y="0"><committed/></location><location id="id9" x="208" y="0"><label kind="invariant" x="232" y="-8">forall(i : Timer) ((not timer_passed[i]) imply time &lt;= timer_t[i])</label></location><init ref="id8"/><transition><source ref="id8"/><target ref="id9"/><label kind="assignment" x="56" y="-24">init_prot()</label></transition><transition><source ref="id9"/><target ref="id9"/><label kind="synchronisation" x="152" y="56">urg_chan!</label><nail x="272" y="48"/><nail x="144" y="48"/></transition><transition><source ref="id9"/><target ref="id9"/><label kind="select" x="160" y="-104">i : Timer</label><label kind="guard" x="48" y="-88">timer_t[i] == time and (not timer_passed[i])</label><label kind="assignment" x="112" y="-72">timer_passed[i] = true</label><nail x="144" y="-48"/><nail x="272" y="-48"/></transition></template><template><name>Bob</name><parameter>Party&amp; me</parameter><location id="id10" x="624" y="32"><name x="640" y="16">accepted</name></location><location id="id11" x="192" y="32"><name x="152" y="48">failure</name></location><location id="id12" x="624" y="-40"><label kind="invariant" x="568" y="-72">time &lt;= MAX_LATENCY</label></location><location id="id13" x="192" y="-40"><label kind="invariant" x="48" y="-72">time &lt;= MAX_LATENCY</label></location><init ref="id13"/><transition><source ref="id10"/><target ref="id10"/><label kind="guard" x="520" y="88">can_send(me, bc[FUSE])</label><label kind="synchronisation" x="568" y="120">urg_chan?</label><label kind="assignment" x="512" y="104">try_to_send(me, bc[FUSE])</label><nail x="528" y="80"/><nail x="720" y="80"/></transition><transition><source ref="id12"/><target ref="id10"/><label kind="guard" x="640" y="-32">can_create_input_script(me, bc[FUSE])</label><label kind="synchronisation" x="720" y="-16">urg_chan?</label></transition><transition><source ref="id12"/><target ref="id11"/><label kind="guard" x="320" y="8">time == MAX_LATENCY</label></transition><transition><source ref="id13"/><target ref="id12"/><label kind="guard" x="272" y="-88">bc[COMMIT].status == CONFIRMED</label><label kind="synchronisation" x="352" y="-72">urg_chan?</label></transition><transition><source ref="id13"/><target ref="id11"/><label kind="guard" x="8" y="-16">time == MAX_LATENCY</label></transition></template><template><name>Adversary</name><parameter>Party&amp; me</parameter><location id="id14" x="568" y="0"></location><init ref="id14"/><transition><source ref="id14"/><target ref="id14"/><label kind="guard" x="56" y="-32">me.know_key[C_KEY] and
+parties[BOB].known_signatures_size == 0</label><label kind="assignment" x="8" y="0">broadcast_signature(create_signature_tx(C_KEY, bc[FUSE]))</label><nail x="448" y="24"/><nail x="448" y="-32"/></transition><transition><source ref="id14"/><target ref="id14"/><label kind="select" x="696" y="-16">i : TxId</label><label kind="assignment" x="696" y="0">try_to_send(me, bc[i])</label><nail x="688" y="-32"/><nail x="688" y="24"/></transition></template><system>BlockChainAgentTA = BlockChainAgent();
+HelperTA = Helper();
+AliceTA = Alice(parties[ALICE]);
+BobTA = Bob(parties[BOB]);
+AdversaryTA = Adversary(parties[ADVERSARY]);
+
+system AdversaryTA, BobTA, BlockChainAgentTA, HelperTA;</system></nta>
